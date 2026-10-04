@@ -38,27 +38,27 @@ def summarize_chunk(text: str) -> str:
     Tạo summary ngắn cho chunk.
     Embed summary thay vì (hoặc cùng với) raw chunk → giảm noise.
     """
-    # TODO: Implement chunk summarization
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return resp.choices[0].message.content.strip()
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI summarize failed: {e}")
-    #
-    # Extractive fallback (không cần API):
-    # sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    # return ". ".join(sentences[:2]) + "." if sentences else text
-    return text
+    from config import GEMINI_API_KEY, GEMINI_ENRICH_MODEL, GEMINI_BASE_URL
+    api_key = GEMINI_API_KEY or OPENAI_API_KEY
+    if api_key and api_key != "sk-..." and os.getenv("LAB_NO_API") != "1":
+        try:
+            if GEMINI_API_KEY:
+                import time
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL if GEMINI_API_KEY else None,
+                              timeout=120, max_retries=12 if GEMINI_API_KEY else 1).chat.completions.create(
+                model=GEMINI_ENRICH_MODEL if GEMINI_API_KEY else "gpt-4o-mini", messages=[
+                    {"role": "system", "content": "Tóm tắt trong 2-3 câu bằng tiếng Việt. Giữ nguyên con số, điều kiện và phủ định."},
+                    {"role": "user", "content": text}],
+                max_tokens=4096 if GEMINI_API_KEY else 150, temperature=0)
+            return response.choices[0].message.content.strip()[:max(1, len(text) * 2)]
+        except Exception as exc:
+            print(f"  Summarize fallback: {type(exc).__name__}")
+    import re
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.replace("\n", " ")) if s.strip()]
+    return " ".join(sentences[:2]) if sentences else text
 
 
 # ─── Technique 2: Hypothesis Question-Answer (HyQA) ─────
@@ -69,29 +69,31 @@ def generate_hypothesis_questions(text: str, n_questions: int = 3) -> list[str]:
     Generate câu hỏi mà chunk có thể trả lời.
     Index cả questions lẫn chunk → query match tốt hơn (bridge vocabulary gap).
     """
-    # TODO: Implement HyQA generation
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": f"Dựa trên đoạn văn, tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. Trả về mỗi câu hỏi trên 1 dòng."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=200,
-    #         )
-    #         questions = resp.choices[0].message.content.strip().split("\n")
-    #         return [q.strip().lstrip("0123456789.-) ") for q in questions if q.strip()][:n_questions]
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI HyQA failed: {e}")
-    #
-    # Extractive fallback:
-    # import re
-    # sentences = [s.strip() for s in re.split(r'[.!?\n]', text) if len(s.strip()) > 10]
-    # return [f"{s.rstrip('.')}?" for s in sentences[:n_questions]]
-    return []
+    if n_questions <= 0:
+        return []
+    from config import GEMINI_API_KEY, GEMINI_ENRICH_MODEL, GEMINI_BASE_URL
+    api_key = GEMINI_API_KEY or OPENAI_API_KEY
+    if api_key and api_key != "sk-..." and os.getenv("LAB_NO_API") != "1":
+        try:
+            if GEMINI_API_KEY:
+                import time
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL if GEMINI_API_KEY else None,
+                              timeout=120, max_retries=12 if GEMINI_API_KEY else 1).chat.completions.create(
+                model=GEMINI_ENRICH_MODEL if GEMINI_API_KEY else "gpt-4o-mini", messages=[
+                    {"role": "system", "content": f"Tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. Mỗi câu trên một dòng. Không thêm dữ kiện."},
+                    {"role": "user", "content": text}],
+                max_tokens=4096 if GEMINI_API_KEY else 200, temperature=0)
+            questions = response.choices[0].message.content.strip().splitlines()
+            return [question.strip().lstrip("0123456789.-) ")
+                    for question in questions if question.strip()][:n_questions]
+        except Exception as exc:
+            print(f"  HyQA fallback: {type(exc).__name__}")
+    import re
+    sentences = [s.strip() for s in re.split(r"[.!?\n]", text) if len(s.strip()) > 10]
+    return [f"{sentence.rstrip('.')}?" for sentence in sentences[:n_questions]]
 
 
 # ─── Technique 3: Contextual Prepend (Anthropic style) ──
@@ -102,28 +104,27 @@ def contextual_prepend(text: str, document_title: str = "") -> str:
     Prepend context giải thích chunk nằm ở đâu trong document.
     Anthropic benchmark: giảm 49% retrieval failure (alone).
     """
-    # TODO: Implement contextual prepend
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và nói về chủ đề gì. Chỉ trả về 1 câu."},
-    #                 {"role": "user", "content": f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=80,
-    #         )
-    #         context = resp.choices[0].message.content.strip()
-    #         return f"{context}\n\n{text}"
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI contextual failed: {e}")
-    #
-    # Simple fallback:
-    # prefix = f"Trích từ {document_title}. " if document_title else ""
-    # return f"{prefix}{text}"
-    return text
+    from config import GEMINI_API_KEY, GEMINI_ENRICH_MODEL, GEMINI_BASE_URL
+    api_key = GEMINI_API_KEY or OPENAI_API_KEY
+    if api_key and api_key != "sk-..." and os.getenv("LAB_NO_API") != "1":
+        try:
+            if GEMINI_API_KEY:
+                import time
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL if GEMINI_API_KEY else None,
+                              timeout=120, max_retries=12 if GEMINI_API_KEY else 1).chat.completions.create(
+                model=GEMINI_ENRICH_MODEL if GEMINI_API_KEY else "gpt-4o-mini", messages=[
+                    {"role": "system", "content": "Viết một câu ngắn mô tả nguồn và chủ đề đoạn văn. Chỉ dùng thông tin được cung cấp."},
+                    {"role": "user", "content": f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"}],
+                max_tokens=4096 if GEMINI_API_KEY else 80, temperature=0)
+            context = response.choices[0].message.content.strip()
+            return f"{context}\n\n{text}"
+        except Exception as exc:
+            print(f"  Contextual fallback: {type(exc).__name__}")
+    prefix = f"Trích từ {document_title}.\n\n" if document_title else ""
+    return f"{prefix}{text}"
 
 
 # ─── Technique 4: Auto Metadata Extraction ──────────────
@@ -133,26 +134,31 @@ def extract_metadata(text: str) -> dict:
     """
     LLM extract metadata tự động: topic, entities, date_range, category.
     """
-    # TODO: Implement auto metadata extraction
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": 'Trích xuất metadata từ đoạn văn. Trả về JSON: {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}'},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI metadata failed: {e}")
-    #
-    # return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
-    return {}
+    from config import GEMINI_API_KEY, GEMINI_ENRICH_MODEL, GEMINI_BASE_URL
+    api_key = GEMINI_API_KEY or OPENAI_API_KEY
+    if api_key and api_key != "sk-..." and os.getenv("LAB_NO_API") != "1":
+        try:
+            if GEMINI_API_KEY:
+                import time
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+            import json
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL if GEMINI_API_KEY else None,
+                              timeout=120, max_retries=12 if GEMINI_API_KEY else 1).chat.completions.create(
+                model=GEMINI_ENRICH_MODEL if GEMINI_API_KEY else "gpt-4o-mini",
+                response_format={"type": "json_object"}, messages=[
+                    {"role": "system", "content": 'Trích metadata và trả JSON với topic, entities (list), category (policy|hr|it|finance), language (vi|en). Chỉ dùng thông tin trong đoạn văn.'},
+                    {"role": "user", "content": text}],
+                max_tokens=4096 if GEMINI_API_KEY else 150, temperature=0)
+            result = json.loads(response.choices[0].message.content)
+            if not isinstance(result, dict):
+                raise TypeError("Metadata must be a JSON object")
+            return {key: result[key] for key in ("topic", "entities", "category", "language")
+                    if key in result}
+        except Exception as exc:
+            print(f"  Metadata fallback: {type(exc).__name__}")
+    return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
 
 
 # ─── Combined Single-Call Mode ───────────────────────────
@@ -163,30 +169,51 @@ def _enrich_single_call(text: str, source: str) -> dict:
 
     ⚠️ Cost optimization: 1 API call thay vì 4 calls riêng lẻ.
     """
-    # TODO: Implement combined enrichment (1 call/chunk)
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": """Phân tích đoạn văn và trả về JSON:
-    # {
-    #   "summary": "tóm tắt 2-3 câu",
-    #   "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"],
-    #   "context": "1 câu mô tả đoạn văn nằm ở đâu trong tài liệu",
-    #   "metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}
-    # }"""},
-    #                 {"role": "user", "content": f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=400,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  Enrichment API failed: {e}")
-    return {}
+    import json
+    import re
+
+    from config import GEMINI_API_KEY, GEMINI_ENRICH_MODEL, GEMINI_BASE_URL
+    api_key = GEMINI_API_KEY or OPENAI_API_KEY
+    if api_key and api_key != "sk-..." and os.getenv("LAB_NO_API") != "1":
+        try:
+            if GEMINI_API_KEY:
+                import time
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+            from openai import OpenAI
+            response = OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL if GEMINI_API_KEY else None,
+                              timeout=120, max_retries=12 if GEMINI_API_KEY else 1).chat.completions.create(
+                model=GEMINI_ENRICH_MODEL if GEMINI_API_KEY else "gpt-4o-mini",
+                response_format={"type": "json_object"}, temperature=0,
+                messages=[
+                    {"role": "system", "content": (
+                        "Phân tích đoạn văn và trả JSON với summary (2-3 câu), questions (3 câu hỏi), "
+                        "context (1 câu về nguồn/chủ đề), metadata (topic, entities, category, language). "
+                        "Chỉ dùng thông tin được cung cấp; giữ con số, điều kiện, phủ định và phiên bản.")},
+                    {"role": "user", "content": f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"}],
+                max_tokens=4096 if GEMINI_API_KEY else 500)
+            result = json.loads(response.choices[0].message.content)
+            if not isinstance(result, dict):
+                raise TypeError("Enrichment must be a JSON object")
+            metadata = result.get("metadata", {})
+            questions = result.get("questions", [])
+            return {
+                "summary": str(result.get("summary", "")),
+                "questions": [q for q in questions if isinstance(q, str)][:3]
+                             if isinstance(questions, list) else [],
+                "context": str(result.get("context", "")),
+                "metadata": {key: metadata[key] for key in ("topic", "entities", "category", "language")
+                             if key in metadata} if isinstance(metadata, dict) else {},
+            }
+        except Exception as exc:
+            print(f"  Enrichment fallback: {type(exc).__name__}")
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    return {
+        "summary": " ".join(sentences[:2]),
+        "questions": [f"{sentence.rstrip('.')}?" for sentence in sentences[:3]],
+        "context": f"Trích từ tài liệu {source}." if source else "",
+        "metadata": {"topic": "general", "entities": [], "category": "policy", "language": "vi"},
+    }
 
 
 # ─── Full Enrichment Pipeline ────────────────────────────

@@ -39,6 +39,9 @@ def main():
     questions, answers, all_contexts, ground_truths = [], [], [], []
 
     from config import OPENAI_API_KEY
+    from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_BASE_URL
+    if GEMINI_API_KEY:
+        OPENAI_API_KEY = ""
     llm_client = None
     if OPENAI_API_KEY:
         from openai import OpenAI
@@ -60,6 +63,21 @@ def main():
                 answer = contexts[0]
         else:
             answer = contexts[0] if contexts else "Không tìm thấy."
+
+        if GEMINI_API_KEY and contexts and os.getenv("LAB_NO_API") != "1":
+            try:
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+                from openai import OpenAI
+                client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL,
+                                timeout=120, max_retries=12)
+                response = client.chat.completions.create(model=GEMINI_MODEL, temperature=0,
+                    max_tokens=4096, messages=[
+                        {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có thông tin, nói 'Không tìm thấy.'"},
+                        {"role": "user", "content": "Context:\n" + "\n\n".join(contexts) + f"\n\nCâu hỏi: {item['question']}"}])
+                answer = response.choices[0].message.content.strip() or answer
+            except Exception as exc:
+                print(f"  Gemini generation fallback: {type(exc).__name__}", flush=True)
 
         answers.append(answer)
         questions.append(item["question"])

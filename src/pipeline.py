@@ -28,9 +28,10 @@ def build_pipeline():
     t0 = time.time()
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
-    all_chunks = []
+    all_chunks, parent_texts = [], {}
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        parent_texts.update({p.metadata["parent_id"]: p.text for p in parents})
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
@@ -50,6 +51,7 @@ def build_pipeline():
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
     search = HybridSearch()
     search.index(all_chunks)
+    search.parent_texts = parent_texts
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 4: Reranker (M3)
@@ -61,12 +63,52 @@ def build_pipeline():
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker,
+              timings: dict | None = None) -> tuple[str, list[str]]:
     """Run single query through pipeline."""
+    timings = timings if timings is not None else {}
+    t0 = time.perf_counter()
     results = search.search(query)
+    timings["search_ms"] = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
-    reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    reranked = reranker.rerank(query, docs, top_k=len(docs))
+    timings["rerank_ms"] = (time.perf_counter() - t0) * 1000
+    # Hierarchical retrieval: match on small child chunks, answer from their parent chunks.
+    parent_texts = getattr(search, "parent_texts", {})
+    contexts = []
+    for r in reranked or results:
+        text = parent_texts.get(r.metadata.get("parent_id"), r.text)
+        if text not in contexts:
+            contexts.append(text)
+        if len(contexts) == RERANK_TOP_K:
+            break
+    t0 = time.perf_counter()
+    answer = _generate(query, contexts)
+    timings["generate_ms"] = (time.perf_counter() - t0) * 1000
+    return answer, contexts
+
+
+def _generate(query: str, contexts: list[str]) -> str:
+    """LLM answer grounded on the retrieved contexts."""
+    from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_BASE_URL
+    if GEMINI_API_KEY:
+        answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+        if contexts and os.getenv("LAB_NO_API") != "1":
+            try:
+                from config import GEMINI_REQUEST_INTERVAL
+                time.sleep(GEMINI_REQUEST_INTERVAL)
+                from openai import OpenAI
+                client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL,
+                                timeout=120, max_retries=12)
+                response = client.chat.completions.create(model=GEMINI_MODEL, temperature=0,
+                    max_tokens=4096, messages=[
+                        {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có thông tin, nói 'Không tìm thấy.'"},
+                        {"role": "user", "content": "Context:\n" + "\n\n".join(contexts) + f"\n\nCâu hỏi: {query}"}])
+                answer = response.choices[0].message.content.strip() or answer
+            except Exception as exc:
+                print(f"  Gemini generation fallback: {type(exc).__name__}", flush=True)
+        return answer
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
@@ -84,7 +126,7 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."
-    return answer, contexts
+    return answer
 
 
 def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
@@ -92,9 +134,12 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     test_set = load_test_set()
     print(f"\n[Eval] Running {len(test_set)} queries...", flush=True)
     questions, answers, all_contexts, ground_truths = [], [], [], []
+    latencies = []
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+        timings = {}
+        answer, contexts = run_query(item["question"], search, reranker, timings)
+        latencies.append(timings)
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
@@ -105,6 +150,9 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     print(f"\n[Eval] Running RAGAS (4 metrics × {len(test_set)} questions)...", flush=True)
     results = evaluate_ragas(questions, answers, all_contexts, ground_truths)
     print(f"  ✓ RAGAS done ({time.time()-t0:.1f}s)", flush=True)
+    results["latency_ms"] = {step: round(sum(t[step] for t in latencies) / len(latencies), 1)
+                             for step in latencies[0]} if latencies else {}
+    print(f"  Avg latency per query (ms): {results['latency_ms']}", flush=True)
 
     print("\n" + "=" * 60)
     print("PRODUCTION RAG SCORES")
